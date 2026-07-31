@@ -1,0 +1,599 @@
+name: production-release-controller
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact future or existing production tag
+        required: true
+        type: string
+      source_sha:
+        description: Exact private main source commit
+        required: true
+        type: string
+      mode:
+        description: Build-only preflight or immutable publication
+        required: true
+        type: choice
+        options:
+          - build-only
+          - publish
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-release-controller-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Check out public release controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          path: controller
+
+      - name: Mask private source identity
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REPOSITORY"
+          printf '::add-mask::%s\n' "$SOURCE_REPOSITORY"
+
+      - name: Check out exact private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ secrets.SOURCE_REPOSITORY }}
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate private source provenance and CI
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+          SOURCE_REPO_READ_TOKEN: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40,64}$ ]]
+          case "$RELEASE_MODE" in
+            build-only|publish)
+              ;;
+            *)
+              printf 'Unsupported release mode.\n' >&2
+              exit 1
+              ;;
+          esac
+
+          actual_sha="$(git -C source rev-parse HEAD)"
+          test "$actual_sha" = "$SOURCE_SHA"
+          git -C source fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          git -C source merge-base --is-ancestor "$SOURCE_SHA" \
+            refs/remotes/origin/main
+
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          tag_query="${RUNNER_TEMP}/private-release-tag.txt"
+          set +e
+          git -C source ls-remote --exit-code --tags --refs \
+            origin "$tag_ref" > "$tag_query" 2>/dev/null
+          tag_status=$?
+          set -e
+          case "$tag_status" in
+            0)
+              git -C source fetch --force --no-tags \
+                origin "${tag_ref}:${tag_ref}"
+              tag_commit="$(
+                git -C source rev-parse "refs/tags/${RELEASE_TAG}^{commit}"
+              )"
+              test "$tag_commit" = "$SOURCE_SHA" || {
+                printf 'The private release tag points to another commit.\n' >&2
+                exit 1
+              }
+              ;;
+            2)
+              case "$RELEASE_MODE" in
+                build-only)
+                  ;;
+                publish)
+                  printf 'Publish mode requires an existing private tag.\n' >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              printf 'Private release tag lookup failed.\n' >&2
+              exit 1
+              ;;
+          esac
+
+          git -C source config --local --unset-all \
+            http.https://github.com/.extraheader || true
+          cmp controller/.github/workflows/release.yml \
+            source/distribution/github/workflows/release.yml
+
+          ci_response="${RUNNER_TEMP}/private-mobile-ci-runs.json"
+          ci_status="$(
+            curl --silent --show-error \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${SOURCE_REPO_READ_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --output "$ci_response" \
+              --write-out '%{http_code}' \
+              "https://api.github.com/repos/${SOURCE_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&head_sha=${SOURCE_SHA}&per_page=100"
+          )"
+          test "$ci_status" = "200" || {
+            printf 'Private mobile CI lookup failed.\n' >&2
+            exit 1
+          }
+          python - "$ci_response" "$SOURCE_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          response_path = Path(sys.argv[1])
+          source_sha = sys.argv[2]
+          try:
+              payload = json.loads(response_path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as error:
+              raise SystemExit("private mobile CI response is invalid") from error
+          if not isinstance(payload, dict):
+              raise SystemExit("private mobile CI response must be an object")
+          runs = payload.get("workflow_runs")
+          if not isinstance(runs, list):
+              raise SystemExit("private mobile CI runs must be an array")
+          for run in runs:
+              if not isinstance(run, dict):
+                  raise SystemExit("private mobile CI run must be an object")
+              required_fields = ("name", "head_sha", "event", "status", "conclusion")
+              if any(field not in run for field in required_fields):
+                  raise SystemExit("private mobile CI run is missing required fields")
+          matching = [
+              run
+              for run in runs
+              if run["name"] == "mobile-ci"
+              and run["head_sha"] == source_sha
+              and run["event"] == "push"
+              and run["status"] == "completed"
+              and run["conclusion"] == "success"
+          ]
+          if not matching:
+              raise SystemExit(
+                  "source SHA has no successful completed mobile-ci push run"
+              )
+          PY
+
+      - name: Read latest public release metadata
+        id: previous-release
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_release_path="${RUNNER_TEMP}/latest-public-release.json"
+          manifest_path="${RUNNER_TEMP}/previous-release-manifest.json"
+          release_status="$(
+            curl --silent --show-error \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --output "$latest_release_path" \
+              --write-out '%{http_code}' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
+          )"
+          case "$release_status" in
+            404)
+              rm -f "$latest_release_path" "$manifest_path"
+              printf 'arguments=\n' >> "$GITHUB_OUTPUT"
+              ;;
+            200)
+              manifest_url="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/release-manifest.json"
+              manifest_status="$(
+                curl --silent --show-error --location \
+                  --output "$manifest_path" \
+                  --write-out '%{http_code}' \
+                  "$manifest_url"
+              )"
+              test "$manifest_status" = "200" || {
+                printf 'Latest public release metadata is unavailable.\n' >&2
+                exit 1
+              }
+              printf 'arguments=--previous-manifest %q\n' \
+                "$manifest_path" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              printf 'Latest public release lookup failed.\n' >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Validate version metadata
+        id: metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          previous_arguments="${{ steps.previous-release.outputs.arguments }}"
+          # shellcheck disable=SC2086
+          python source/tool/release_metadata.py validate \
+            --tag "$RELEASE_TAG" \
+            --pubspec source/pubspec.yaml \
+            $previous_arguments \
+            --github-output "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          flutter-version: 3.44.7
+          channel: stable
+          cache: true
+
+      - name: Install private source dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Prepare temporary production signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for required_name in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD \
+            ANDROID_STORE_PASSWORD
+          do
+            test -n "${!required_name}" || {
+              printf 'Missing required signing input: %s\n' "$required_name" >&2
+              exit 1
+            }
+          done
+          keystore_path="${RUNNER_TEMP}/guard-production.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" |
+            base64 --decode > "$keystore_path"
+          chmod 600 "$keystore_path"
+          KEYSTORE_PATH="$keystore_path" \
+            python controller/tool/java_properties.py android-signing \
+              --output source/android/key.properties
+          chmod 600 source/android/key.properties
+
+      - name: Build production Android artifacts
+        working-directory: source
+        shell: bash
+        env:
+          PROD_API_BASE_URL: ${{ vars.PROD_API_BASE_URL }}
+          PROD_WS_BASE_URL: ${{ vars.PROD_WS_BASE_URL }}
+          SUPPORT_PHONE: ${{ vars.SUPPORT_PHONE }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          from urllib.parse import urlsplit
+
+          def require_url(name: str):
+              value = os.environ.get(name, "")
+              if not value or any(character.isspace() for character in value):
+                  raise SystemExit(f"{name} is missing or contains whitespace")
+              try:
+                  parsed = urlsplit(value)
+                  parsed.port
+                  return parsed
+              except ValueError as error:
+                  raise SystemExit(f"{name} is invalid: {error}") from error
+
+          api = require_url("PROD_API_BASE_URL")
+          if (
+              api.scheme != "https"
+              or not api.hostname
+              or api.username is not None
+              or api.password is not None
+              or not api.path.endswith("/api/v1")
+              or api.query
+              or api.fragment
+          ):
+              raise SystemExit(
+                  "PROD_API_BASE_URL must be credential-free HTTPS, end in "
+                  "/api/v1, and contain no query or fragment"
+              )
+
+          websocket = require_url("PROD_WS_BASE_URL")
+          if (
+              websocket.scheme != "wss"
+              or not websocket.hostname
+              or websocket.username is not None
+              or websocket.password is not None
+              or websocket.path
+              or websocket.query
+              or websocket.fragment
+          ):
+              raise SystemExit(
+                  "PROD_WS_BASE_URL must be a credential-free WSS origin"
+              )
+
+          support_phone = os.environ.get("SUPPORT_PHONE", "")
+          support_phone_pattern = re.compile(r"^\+?[0-9 ()-]{5,32}$")
+          if not support_phone_pattern.fullmatch(support_phone):
+              raise SystemExit("SUPPORT_PHONE is invalid")
+          PY
+          flutter build apk --release --flavor prod \
+            --dart-define=APP_ENV=prod \
+            --dart-define=API_BASE_URL="$PROD_API_BASE_URL" \
+            --dart-define=WS_BASE_URL="$PROD_WS_BASE_URL" \
+            --dart-define=SUPPORT_PHONE="$SUPPORT_PHONE"
+          flutter build appbundle --release --flavor prod \
+            --dart-define=APP_ENV=prod \
+            --dart-define=API_BASE_URL="$PROD_API_BASE_URL" \
+            --dart-define=WS_BASE_URL="$PROD_WS_BASE_URL" \
+            --dart-define=SUPPORT_PHONE="$SUPPORT_PHONE"
+
+      - name: Verify and package production artifacts
+        shell: bash
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          build_tools="$(
+            find "${ANDROID_HOME}/build-tools" \
+              -mindepth 1 -maxdepth 1 -type d -print |
+              sort -V |
+              tail -n 1
+          )"
+          test -n "$build_tools"
+          apksigner="${build_tools}/apksigner"
+          zipalign="${build_tools}/zipalign"
+          aapt="${build_tools}/aapt"
+          apk_path="source/build/app/outputs/flutter-apk/app-prod-release.apk"
+          aab_path="source/build/app/outputs/bundle/prodRelease/app-prod-release.aab"
+          test -f "$apk_path"
+          test -f "$aab_path"
+          jarsigner -verify -strict \
+            -keystore "${RUNNER_TEMP}/guard-production.jks" \
+            -storepass:env ANDROID_STORE_PASSWORD \
+            "$aab_path"
+
+          package_id="$(
+            "$aapt" dump badging "$apk_path" |
+              sed -n "s/^package: name='\([^']*\)'.*/\1/p"
+          )"
+          test "$package_id" = "ru.altparking.guard"
+          "$apksigner" verify --verbose "$apk_path"
+          actual_certificate="$(
+            "$apksigner" verify --print-certs "$apk_path" |
+              sed -n 's/^Signer #1 certificate SHA-256 digest: //p'
+          )"
+          expected_certificate="$(
+            keytool -exportcert \
+              -alias "$ANDROID_KEY_ALIAS" \
+              -keystore "${RUNNER_TEMP}/guard-production.jks" \
+              -storepass:env ANDROID_STORE_PASSWORD |
+              sha256sum |
+              awk '{print $1}'
+          )"
+          test -n "$actual_certificate"
+          test "$actual_certificate" = "$expected_certificate"
+          "$zipalign" -c -v 4 "$apk_path"
+
+          asset_directory="${RUNNER_TEMP}/production-public-assets"
+          private_directory="${RUNNER_TEMP}/production-private-aab"
+          mkdir -p "$asset_directory" "$private_directory"
+          apk_name="ALT-PARKING-Guard-${RELEASE_TAG}.apk"
+          aab_name="ALT-PARKING-Guard-${RELEASE_TAG}.aab"
+          cp "$apk_path" "${asset_directory}/${apk_name}"
+          cp "$aab_path" "${private_directory}/${aab_name}"
+          (
+            cd "$asset_directory"
+            sha256sum "$apk_name" > SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+          (
+            cd "$private_directory"
+            sha256sum "$aab_name" > AAB-SHA256SUMS.txt
+            sha256sum --check AAB-SHA256SUMS.txt
+          )
+          apk_sha256="$(
+            sha256sum "${asset_directory}/${apk_name}" |
+              awk '{print $1}'
+          )"
+          built_at="$(git -C source show -s --format=%cI "$SOURCE_SHA")"
+          python source/tool/release_metadata.py manifest \
+            --tag "$RELEASE_TAG" \
+            --pubspec source/pubspec.yaml \
+            --package-id "$package_id" \
+            --source-sha "$SOURCE_SHA" \
+            --apk-sha256 "$apk_sha256" \
+            --built-at "$built_at" \
+            --output "${asset_directory}/release-manifest.json"
+          expected_asset_names="$(
+            printf '%s\n' \
+              "$apk_name" \
+              SHA256SUMS.txt \
+              release-manifest.json |
+              sort
+          )"
+          actual_asset_names="$(
+            find "$asset_directory" -mindepth 1 -maxdepth 1 -type f \
+              -printf '%f\n' |
+              sort
+          )"
+          test "$actual_asset_names" = "$expected_asset_names"
+
+      - name: Upload verified APK release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: production-public-assets-${{ inputs.tag }}-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/production-public-assets
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove temporary production material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "${GITHUB_WORKSPACE}/source/android/key.properties"
+          rm -f "${RUNNER_TEMP}/guard-production.jks"
+          rm -rf "${RUNNER_TEMP}/production-private-aab"
+          rm -rf "${RUNNER_TEMP}/production-public-assets"
+          rm -rf "${GITHUB_WORKSPACE}/source"
+          rm -f "${RUNNER_TEMP}/private-release-tag.txt"
+          rm -f "${RUNNER_TEMP}/private-mobile-ci-runs.json"
+          rm -f "${RUNNER_TEMP}/latest-public-release.json"
+          rm -f "${RUNNER_TEMP}/previous-release-manifest.json"
+
+  publish:
+    if: ${{ inputs.mode == 'publish' }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out public release controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          path: controller
+
+      - name: Download verified APK release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: production-public-assets-${{ inputs.tag }}-${{ inputs.source_sha }}
+          path: release-assets
+
+      - name: Publish verified public release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          apk_name="ALT-PARKING-Guard-${tag}.apk"
+          cd release-assets
+          sha256sum --check SHA256SUMS.txt
+
+          page=1
+          page_size=100
+          release_pages=()
+          while test "$page_size" -eq 100
+          do
+            page_path="$(
+              printf '%s/public-releases-%06d.json' "$RUNNER_TEMP" "$page"
+            )"
+            release_status="$(
+              curl --silent --show-error \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                --output "$page_path" \
+                --write-out '%{http_code}' \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}"
+            )"
+            test "$release_status" = "200" || {
+              printf 'Public release lookup failed.\n' >&2
+              exit 1
+            }
+            page_size="$(
+              python -c \
+                'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); isinstance(value, list) or sys.exit("release API page must be an array"); print(len(value))' \
+                "$page_path"
+            )"
+            release_pages+=("$page_path")
+            page=$((page + 1))
+          done
+
+          release_state="$(
+            python controller/tool/release_state.py select \
+              --tag "$tag" \
+              "${release_pages[@]}"
+          )"
+          case "$release_state" in
+            absent)
+              gh release create "$tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "ALT:PARKING Guard ${tag#v}" \
+                --notes "Проверенная production-сборка ALT:PARKING Guard ${tag#v}." \
+                --draft
+              ;;
+            draft)
+              :
+              ;;
+            published)
+              printf 'Existing release is published and immutable.\n' >&2
+              exit 1
+              ;;
+            *)
+              printf 'Unexpected public release state.\n' >&2
+              exit 1
+              ;;
+          esac
+
+          gh release upload "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            "$apk_name" \
+            SHA256SUMS.txt \
+            release-manifest.json
+
+          verification_directory="${RUNNER_TEMP}/verified-public-release"
+          mkdir -p "$verification_directory"
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$verification_directory" \
+            --pattern "$apk_name" \
+            --pattern SHA256SUMS.txt \
+            --pattern release-manifest.json
+          (
+            cd "$verification_directory"
+            sha256sum --check SHA256SUMS.txt
+          )
+          cmp release-manifest.json \
+            "${verification_directory}/release-manifest.json"
+          expected_asset_names="$(
+            printf '%s\n' \
+              "$apk_name" \
+              SHA256SUMS.txt \
+              release-manifest.json |
+              sort
+          )"
+          actual_asset_names="$(
+            find "$verification_directory" \
+              -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+              sort
+          )"
+          test "$actual_asset_names" = "$expected_asset_names"
+
+          gh release edit "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
