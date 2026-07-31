@@ -412,18 +412,26 @@ jobs:
           expected_certificate="$(
             normalize_certificate_fingerprint "$expected_certificate"
           )"
-          [[ "$actual_certificate" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$expected_certificate" =~ ^[0-9a-f]{64}$ ]]
-          if test "$actual_certificate" != "$expected_certificate"
-          then
-            printf 'APK signer fingerprint: %s\n' "$actual_certificate" >&2
-            printf 'Keystore alias fingerprint: %s\n' \
-              "$expected_certificate" >&2
-            printf '%s\n' \
-              'APK signer certificate does not match the configured keystore alias.' \
-              >&2
-            exit 1
-          fi
+          python - "$actual_certificate" "$expected_certificate" <<'PY'
+          import re
+          import sys
+
+          actual, expected = sys.argv[1:]
+          for label, fingerprint in (
+              ("APK signer", actual),
+              ("Keystore alias", expected),
+          ):
+              if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                  raise SystemExit(
+                      f"{label} fingerprint is not a 64-character lowercase hex digest"
+                  )
+          if actual != expected:
+              print(f"APK signer fingerprint: {actual}", file=sys.stderr)
+              print(f"Keystore alias fingerprint: {expected}", file=sys.stderr)
+              raise SystemExit(
+                  "APK signer certificate does not match the configured keystore alias."
+              )
+          PY
           "$zipalign" -c -v 4 "$apk_path"
 
           asset_directory="${RUNNER_TEMP}/production-public-assets"
