@@ -391,12 +391,14 @@ jobs:
             "$apksigner" verify --print-certs "$apk_path" |
               sed -n 's/^Signer #1 certificate SHA-256 digest: //p'
           )"
+          expected_certificate_path="${RUNNER_TEMP}/expected-production-cert.der"
+          keytool -exportcert \
+            -alias "$ANDROID_KEY_ALIAS" \
+            -keystore "${RUNNER_TEMP}/guard-production.jks" \
+            -storepass:env ANDROID_STORE_PASSWORD \
+            -file "$expected_certificate_path" >/dev/null
           expected_certificate="$(
-            keytool -exportcert \
-              -alias "$ANDROID_KEY_ALIAS" \
-              -keystore "${RUNNER_TEMP}/guard-production.jks" \
-              -storepass:env ANDROID_STORE_PASSWORD |
-              sha256sum |
+            sha256sum "$expected_certificate_path" |
               awk '{print $1}'
           )"
           normalize_certificate_fingerprint() {
@@ -412,7 +414,16 @@ jobs:
           )"
           [[ "$actual_certificate" =~ ^[0-9a-f]{64}$ ]]
           [[ "$expected_certificate" =~ ^[0-9a-f]{64}$ ]]
-          test "$actual_certificate" = "$expected_certificate"
+          if test "$actual_certificate" != "$expected_certificate"
+          then
+            printf 'APK signer fingerprint: %s\n' "$actual_certificate" >&2
+            printf 'Keystore alias fingerprint: %s\n' \
+              "$expected_certificate" >&2
+            printf '%s\n' \
+              'APK signer certificate does not match the configured keystore alias.' \
+              >&2
+            exit 1
+          fi
           "$zipalign" -c -v 4 "$apk_path"
 
           asset_directory="${RUNNER_TEMP}/production-public-assets"
@@ -474,6 +485,7 @@ jobs:
           set -euo pipefail
           rm -f "${GITHUB_WORKSPACE}/source/android/key.properties"
           rm -f "${RUNNER_TEMP}/guard-production.jks"
+          rm -f "${RUNNER_TEMP}/expected-production-cert.der"
           rm -rf "${RUNNER_TEMP}/production-private-aab"
           rm -rf "${RUNNER_TEMP}/production-public-assets"
           rm -rf "${GITHUB_WORKSPACE}/source"
