@@ -387,9 +387,31 @@ jobs:
           )"
           test "$package_id" = "ru.altparking.guard"
           "$apksigner" verify --verbose "$apk_path"
+          actual_certificate_pem_path="${RUNNER_TEMP}/apk-signer-certificate.pem"
+          "$apksigner" verify --print-certs-pem "$apk_path" > \
+            "$actual_certificate_pem_path"
           actual_certificate="$(
-            "$apksigner" verify --print-certs "$apk_path" |
-              sed -n 's/^Signer #1 certificate SHA-256 digest: //p'
+            python - "$actual_certificate_pem_path" <<'PY'
+          import base64
+          import hashlib
+          import re
+          import sys
+          from pathlib import Path
+
+          pem_text = Path(sys.argv[1]).read_text(encoding="ascii")
+          matches = re.findall(
+              r"-----BEGIN CERTIFICATE-----\s*(.*?)\s*-----END CERTIFICATE-----",
+              pem_text,
+              flags=re.DOTALL,
+          )
+          if len(matches) != 1:
+              raise SystemExit("APK must expose exactly one signing certificate")
+          certificate = base64.b64decode(
+              re.sub(r"\s+", "", matches[0]),
+              validate=True,
+          )
+          print(hashlib.sha256(certificate).hexdigest())
+          PY
           )"
           expected_certificate_path="${RUNNER_TEMP}/expected-production-cert.der"
           keytool -exportcert \
@@ -493,6 +515,7 @@ jobs:
           set -euo pipefail
           rm -f "${GITHUB_WORKSPACE}/source/android/key.properties"
           rm -f "${RUNNER_TEMP}/guard-production.jks"
+          rm -f "${RUNNER_TEMP}/apk-signer-certificate.pem"
           rm -f "${RUNNER_TEMP}/expected-production-cert.der"
           rm -rf "${RUNNER_TEMP}/production-private-aab"
           rm -rf "${RUNNER_TEMP}/production-public-assets"
