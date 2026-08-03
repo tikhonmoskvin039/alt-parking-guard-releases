@@ -178,6 +178,60 @@ jobs:
               )
           PY
 
+      - name: Prepare temporary Firebase Android config
+        shell: bash
+        env:
+          FIREBASE_ANDROID_CONFIG_BASE64: ${{ secrets.FIREBASE_ANDROID_CONFIG_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$FIREBASE_ANDROID_CONFIG_BASE64"
+          config_path="source/android/app/google-services.json"
+          printf '%s' "$FIREBASE_ANDROID_CONFIG_BASE64" |
+            base64 --decode > "$config_path"
+          chmod 600 "$config_path"
+          python - "$config_path" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          try:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as error:
+              raise SystemExit("Firebase Android config is invalid") from error
+          if not isinstance(payload, dict):
+              raise SystemExit("Firebase Android config must be an object")
+          project = payload.get("project_info")
+          clients = payload.get("client")
+          if not isinstance(project, dict):
+              raise SystemExit("Firebase project_info must be an object")
+          project_id = project.get("project_id")
+          if (
+              not isinstance(project_id, str)
+              or project_id != "alt-parking-guard-production"
+          ):
+              raise SystemExit(
+                  "Firebase project_id must be alt-parking-guard-production"
+              )
+          if not isinstance(clients, list):
+              raise SystemExit("Firebase clients are missing")
+          package_names = set()
+          for client in clients:
+              if not isinstance(client, dict):
+                  raise SystemExit("Firebase client entry must be an object")
+              client_info = client.get("client_info")
+              if not isinstance(client_info, dict):
+                  raise SystemExit("Firebase client_info must be an object")
+              android_client_info = client_info.get("android_client_info")
+              if not isinstance(android_client_info, dict):
+                  raise SystemExit(
+                      "Firebase android_client_info must be an object"
+                  )
+              package_names.add(android_client_info.get("package_name"))
+          if "ru.altparking.guard" not in package_names:
+              raise SystemExit("Firebase config does not contain ru.altparking.guard")
+          PY
+
       - name: Read latest public release metadata
         id: previous-release
         shell: bash
@@ -514,6 +568,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f "${GITHUB_WORKSPACE}/source/android/key.properties"
+          rm -f "${GITHUB_WORKSPACE}/source/android/app/google-services.json"
           rm -f "${RUNNER_TEMP}/guard-production.jks"
           rm -f "${RUNNER_TEMP}/apk-signer-certificate.pem"
           rm -f "${RUNNER_TEMP}/expected-production-cert.der"
