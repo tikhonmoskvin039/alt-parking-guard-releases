@@ -344,6 +344,7 @@ jobs:
           PROD_API_BASE_URL: ${{ vars.PROD_API_BASE_URL }}
           PROD_WS_BASE_URL: ${{ vars.PROD_WS_BASE_URL }}
           SUPPORT_PHONE: ${{ vars.SUPPORT_PHONE }}
+          RUSTORE_PUSH_PROJECT_ID: ${{ vars.RUSTORE_PUSH_PROJECT_ID }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -395,6 +396,11 @@ jobs:
           support_phone_pattern = re.compile(r"^\+?[0-9 ()-]{5,32}$")
           if not support_phone_pattern.fullmatch(support_phone):
               raise SystemExit("SUPPORT_PHONE is invalid")
+
+          rustore_project_id = os.environ.get("RUSTORE_PUSH_PROJECT_ID", "")
+          rustore_project_id_pattern = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+          if not rustore_project_id_pattern.fullmatch(rustore_project_id):
+              raise SystemExit("RUSTORE_PUSH_PROJECT_ID is invalid")
           PY
           flutter build apk --release --flavor prod \
             --dart-define=APP_ENV=prod \
