@@ -432,6 +432,13 @@ jobs:
           apksigner="${build_tools}/apksigner"
           zipalign="${build_tools}/zipalign"
           aapt="${build_tools}/aapt"
+          apkanalyzer="$(
+            find "${ANDROID_HOME}/cmdline-tools" \
+              -type f -name apkanalyzer -print |
+              sort -V |
+              tail -n 1
+          )"
+          test -x "$apkanalyzer"
           apk_path="source/build/app/outputs/flutter-apk/app-prod-release.apk"
           aab_path="source/build/app/outputs/bundle/prodRelease/app-prod-release.aab"
           test -f "$apk_path"
@@ -446,6 +453,12 @@ jobs:
               sed -n "s/^package: name='\([^']*\)'.*/\1/p"
           )"
           test "$package_id" = "ru.altparking.guard"
+          work_database_code="${RUNNER_TEMP}/work-database-code.txt"
+          "$apkanalyzer" dex code \
+            --class androidx.work.impl.WorkDatabase_Impl "$apk_path" > \
+            "$work_database_code"
+          grep -Fq '.method public constructor <init>()V' \
+            "$work_database_code"
           "$apksigner" verify --verbose "$apk_path"
           actual_certificate_pem_path="${RUNNER_TEMP}/apk-signer-certificate.pem"
           "$apksigner" verify --print-certs-pem "$apk_path" > \
@@ -578,6 +591,7 @@ jobs:
           rm -f "${RUNNER_TEMP}/guard-production.jks"
           rm -f "${RUNNER_TEMP}/apk-signer-certificate.pem"
           rm -f "${RUNNER_TEMP}/expected-production-cert.der"
+          rm -f "${RUNNER_TEMP}/work-database-code.txt"
           rm -rf "${RUNNER_TEMP}/production-private-aab"
           rm -rf "${RUNNER_TEMP}/production-public-assets"
           rm -rf "${GITHUB_WORKSPACE}/source"
