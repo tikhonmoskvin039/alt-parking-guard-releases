@@ -649,7 +649,7 @@ jobs:
           done
 
           release_state="$(
-            python controller/tool/release_state.py select \
+            python "$GITHUB_WORKSPACE/controller/tool/release_state.py" select \
               --tag "$tag" \
               "${release_pages[@]}"
           )"
