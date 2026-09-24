@@ -12,12 +12,17 @@ on:
         required: true
         type: string
       mode:
-        description: Build-only preflight or immutable publication
+        description: Build preflight, immutable release, or manual RuStore publication
         required: true
         type: choice
         options:
           - build-only
           - publish
+          - rustore-publish
+      confirmation:
+        description: 'RuStore only: PUBLISH ru.altparking.guard <tag> <versionId>'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -28,6 +33,7 @@ concurrency:
 
 jobs:
   build:
+    if: ${{ inputs.mode == 'build-only' || inputs.mode == 'publish' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
@@ -126,6 +132,10 @@ jobs:
             http.https://github.com/.extraheader || true
           cmp controller/.github/workflows/release.yml \
             source/distribution/github/workflows/release.yml
+          cmp controller/tool/rustore_api.py source/tool/rustore_api.py
+          cmp controller/tool/rustore_release.py source/tool/rustore_release.py
+          cmp controller/tool/rustore_api_test.py source/tool/rustore_api_test.py
+          cmp controller/tool/rustore_release_test.py source/tool/rustore_release_test.py
 
           ci_response="${RUNNER_TEMP}/private-mobile-ci-runs.json"
           ci_status="$(
@@ -176,6 +186,26 @@ jobs:
               raise SystemExit(
                   "source SHA has no successful completed mobile-ci push run"
               )
+          PY
+
+      - name: Test reviewed RuStore helpers
+        working-directory: controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest tool.rustore_api_test tool.rustore_release_test -v
+
+      - name: Validate RuStore delivery configuration
+        shell: bash
+        env:
+          RUSTORE_DELIVERY_ENABLED: ${{ vars.RUSTORE_DELIVERY_ENABLED }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          if os.environ.get("RUSTORE_DELIVERY_ENABLED") not in ("true", "false"):
+              raise SystemExit("RUSTORE_DELIVERY_ENABLED must be exactly true or false")
           PY
 
       - name: Prepare temporary Firebase Android config
@@ -414,12 +444,15 @@ jobs:
             --dart-define=SUPPORT_PHONE="$SUPPORT_PHONE"
 
       - name: Verify and package production artifacts
+        id: verified
         shell: bash
         env:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           RELEASE_TAG: ${{ inputs.tag }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPECTED_VERSION_NAME: ${{ steps.metadata.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ steps.metadata.outputs.build_number }}
         run: |
           set -euo pipefail
           build_tools="$(
@@ -453,6 +486,10 @@ jobs:
               sed -n "s/^package: name='\([^']*\)'.*/\1/p"
           )"
           test "$package_id" = "ru.altparking.guard"
+          version_name="$("$apkanalyzer" manifest version-name "$apk_path")"
+          version_code="$("$apkanalyzer" manifest version-code "$apk_path")"
+          test "$version_name" = "$EXPECTED_VERSION_NAME"
+          test "$version_code" = "$EXPECTED_VERSION_CODE"
           work_database_code="${RUNNER_TEMP}/work-database-code.txt"
           "$apkanalyzer" dex code \
             --class androidx.work.impl.WorkDatabase_Impl "$apk_path" > \
@@ -572,6 +609,89 @@ jobs:
               sort
           )"
           test "$actual_asset_names" = "$expected_asset_names"
+          printf 'signer_sha256=%s\n' "$actual_certificate" >> "$GITHUB_OUTPUT"
+
+      - name: Record disabled RuStore submission
+        if: ${{ vars.RUSTORE_DELIVERY_ENABLED == 'false' || inputs.mode == 'build-only' }}
+        shell: bash
+        env:
+          RUSTORE_DELIVERY_ENABLED: ${{ vars.RUSTORE_DELIVERY_ENABLED }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = {
+              "status": "DISABLED",
+              "publishable": False,
+              "reason": "build-only" if os.environ["RELEASE_MODE"] == "build-only" else "delivery-disabled",
+              "packageName": "ru.altparking.guard",
+              "tag": os.environ["RELEASE_TAG"],
+              "sourceSha": os.environ["SOURCE_SHA"],
+              "publishType": "MANUAL",
+              "partialValue": 100,
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "production-public-assets" / "rustore-submission.json"
+          with path.open("xb") as output:
+              output.write((json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
+          PY
+
+      - name: Submit verified APK to RuStore moderation
+        if: ${{ vars.RUSTORE_DELIVERY_ENABLED == 'true' && inputs.mode == 'publish' }}
+        working-directory: controller
+        shell: bash
+        env:
+          RUSTORE_SUBMIT_KEY_ID: ${{ secrets.RUSTORE_SUBMIT_KEY_ID }}
+          RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64 }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SIGNER_SHA256: ${{ steps.verified.outputs.signer_sha256 }}
+          TMPDIR: ${{ runner.temp }}/rustore-private
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "$TMPDIR"
+          asset_directory="${RUNNER_TEMP}/production-public-assets"
+          # The reviewed CLI creates only MANUAL/100 drafts and never publishes.
+          # Its one-attempt journal survives only this runner. Fresh reruns stop
+          # on pre-existing remote drafts/candidates and need operator reconciliation.
+          python -m tool.rustore_release submit \
+            --manifest "${asset_directory}/release-manifest.json" \
+            --apk "${asset_directory}/ALT-PARKING-Guard-${RELEASE_TAG}.apk" \
+            --tag "$RELEASE_TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --signer-sha256 "$SIGNER_SHA256" \
+            --output "${asset_directory}/rustore-submission.json"
+
+      - name: Finalize verified public release bundle
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          asset_directory="${RUNNER_TEMP}/production-public-assets"
+          apk_name="ALT-PARKING-Guard-${RELEASE_TAG}.apk"
+          cd "$asset_directory"
+          sha256sum --check SHA256SUMS.txt
+          sha256sum "$apk_name" release-manifest.json rustore-submission.json > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+          expected_asset_names="$(
+            printf '%s\n' \
+              "$apk_name" \
+              SHA256SUMS.txt \
+              release-manifest.json \
+              rustore-submission.json |
+              sort
+          )"
+          actual_asset_names="$(
+            find "$asset_directory" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+              sort
+          )"
+          test "$actual_asset_names" = "$expected_asset_names"
 
       - name: Upload verified APK release bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -594,6 +714,7 @@ jobs:
           rm -f "${RUNNER_TEMP}/work-database-code.txt"
           rm -rf "${RUNNER_TEMP}/production-private-aab"
           rm -rf "${RUNNER_TEMP}/production-public-assets"
+          rm -rf "${RUNNER_TEMP}/rustore-private"
           rm -rf "${GITHUB_WORKSPACE}/source"
           rm -f "${RUNNER_TEMP}/private-release-tag.txt"
           rm -f "${RUNNER_TEMP}/private-mobile-ci-runs.json"
@@ -693,7 +814,8 @@ jobs:
             --clobber \
             "$apk_name" \
             SHA256SUMS.txt \
-            release-manifest.json
+            release-manifest.json \
+            rustore-submission.json
 
           verification_directory="${RUNNER_TEMP}/verified-public-release"
           mkdir -p "$verification_directory"
@@ -702,18 +824,23 @@ jobs:
             --dir "$verification_directory" \
             --pattern "$apk_name" \
             --pattern SHA256SUMS.txt \
-            --pattern release-manifest.json
+            --pattern release-manifest.json \
+            --pattern rustore-submission.json
           (
             cd "$verification_directory"
             sha256sum --check SHA256SUMS.txt
           )
           cmp release-manifest.json \
             "${verification_directory}/release-manifest.json"
+          cmp rustore-submission.json \
+            "${verification_directory}/rustore-submission.json"
+          cmp SHA256SUMS.txt "${verification_directory}/SHA256SUMS.txt"
           expected_asset_names="$(
             printf '%s\n' \
               "$apk_name" \
               SHA256SUMS.txt \
-              release-manifest.json |
+              release-manifest.json \
+              rustore-submission.json |
               sort
           )"
           actual_asset_names="$(
@@ -723,7 +850,201 @@ jobs:
           )"
           test "$actual_asset_names" = "$expected_asset_names"
 
+          remote_assets="${RUNNER_TEMP}/public-release-assets.json"
+          gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets > "$remote_assets"
+          python - "$remote_assets" "$apk_name" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+              assets = payload["assets"]
+              if not isinstance(assets, list):
+                  raise ValueError()
+              names = [asset["name"] for asset in assets]
+              expected = [sys.argv[2], "SHA256SUMS.txt", "release-manifest.json", "rustore-submission.json"]
+              if sorted(names) != sorted(expected):
+                  raise ValueError()
+          except (OSError, ValueError, TypeError, KeyError):
+              raise SystemExit("Public release must contain exactly the four verified assets") from None
+          PY
+
           gh release edit "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \
             --latest
+
+  rustore-publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'rustore-publish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Check out public release controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          path: controller
+
+      - name: Download exact public release bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          # Interrupted attempts require operator reconciliation and a new dispatch.
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          apk_name="ALT-PARKING-Guard-${RELEASE_TAG}.apk"
+          metadata_path="${RUNNER_TEMP}/rustore-publish-release.json"
+          asset_directory="${RUNNER_TEMP}/rustore-publish-assets"
+          mkdir -m 700 "$asset_directory"
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets > "$metadata_path"
+          python - "$metadata_path" "$RELEASE_TAG" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+              if (payload["tagName"] != sys.argv[2] or payload["isDraft"] is not False
+                      or payload["isPrerelease"] is not False or not isinstance(payload["assets"], list)):
+                  raise ValueError()
+              names = [asset["name"] for asset in payload["assets"]]
+              expected = [f"ALT-PARKING-Guard-{sys.argv[2]}.apk", "release-manifest.json",
+                          "rustore-submission.json", "SHA256SUMS.txt"]
+              if sorted(names) != sorted(expected):
+                  raise ValueError()
+          except (OSError, ValueError, TypeError, KeyError):
+              raise SystemExit("Exact published release with four unique assets required") from None
+          PY
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$asset_directory" \
+            --pattern "$apk_name" \
+            --pattern release-manifest.json \
+            --pattern rustore-submission.json \
+            --pattern SHA256SUMS.txt
+
+      - name: Validate immutable RuStore publication bundle
+        id: publication
+        working-directory: controller
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import os
+          import re
+          from datetime import datetime
+          from pathlib import Path
+          from tool.rustore_release import (
+              ReleaseError, _bound_receipt, _load_object, _validate_confirmation,
+              parse_receipt, request_from_manifest,
+          )
+
+          try:
+              tag = os.environ["RELEASE_TAG"]
+              source_sha = os.environ["SOURCE_SHA"]
+              if (re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag) is None
+                      or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None):
+                  raise ValueError()
+              assets = Path(os.environ["RUNNER_TEMP"]) / "rustore-publish-assets"
+              apk_name = f"ALT-PARKING-Guard-{tag}.apk"
+              checked_names = {apk_name, "release-manifest.json", "rustore-submission.json"}
+              entries = list(assets.iterdir())
+              if ({item.name for item in entries} != checked_names | {"SHA256SUMS.txt"}
+                      or any(not item.is_file() or item.is_symlink() for item in entries)):
+                  raise ValueError()
+              checksums = {}
+              for line in (assets / "SHA256SUMS.txt").read_text(encoding="ascii").splitlines():
+                  match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+                  if match is None or match[2] not in checked_names or match[2] in checksums:
+                      raise ValueError()
+                  checksums[match[2]] = match[1]
+              if set(checksums) != checked_names:
+                  raise ValueError()
+              for name, expected in checksums.items():
+                  with (assets / name).open("rb") as content:
+                      if hashlib.file_digest(content, "sha256").hexdigest() != expected:
+                          raise ValueError()
+              manifest_path = assets / "release-manifest.json"
+              manifest = _load_object(manifest_path.read_bytes())
+              if set(manifest) != {"packageId", "versionName", "buildNumber", "sourceCommit", "apkSha256", "builtAt"}:
+                  raise ValueError()
+              if datetime.fromisoformat(manifest["builtAt"]).tzinfo is None:
+                  raise ValueError()
+              raw = (assets / "rustore-submission.json").read_bytes()
+              receipt_sha256 = checksums["rustore-submission.json"]
+              receipt = parse_receipt(raw, receipt_sha256)
+              # The immutable receipt binds the certificate verified at submission
+              # to these exact APK bytes; no signing material is needed here.
+              request = request_from_manifest(manifest_path, assets / apk_name, tag, source_sha, receipt.signer_sha256)
+              _bound_receipt(request, raw, receipt_sha256)
+              _validate_confirmation(receipt, os.environ["CONFIRMATION"])
+              with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+                  output.write(f"signer_sha256={receipt.signer_sha256}\nreceipt_sha256={receipt_sha256}\n")
+          except (ReleaseError, OSError, ValueError, TypeError, KeyError):
+              raise SystemExit("Immutable RuStore publication bundle validation failed") from None
+          PY
+
+      - name: Publish saved RuStore version
+        working-directory: controller
+        shell: bash
+        env:
+          RUSTORE_PUBLISH_KEY_ID: ${{ secrets.RUSTORE_PUBLISH_KEY_ID }}
+          RUSTORE_PUBLISH_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.RUSTORE_PUBLISH_PRIVATE_KEY_PKCS8_BASE64 }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          SIGNER_SHA256: ${{ steps.publication.outputs.signer_sha256 }}
+          RECEIPT_SHA256: ${{ steps.publication.outputs.receipt_sha256 }}
+          TMPDIR: ${{ runner.temp }}/rustore-publish-private
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "$TMPDIR"
+          asset_directory="${RUNNER_TEMP}/rustore-publish-assets"
+          # CLI queries the saved ID, requires READY_FOR_PUBLICATION, sends one
+          # publish, and succeeds only after that same ID is exactly ACTIVE.
+          # Its attempt marker is local: reconcile any interrupted run before
+          # a new manual dispatch. Never rewrite the immutable receipt.
+          python -m tool.rustore_release publish \
+            --manifest "${asset_directory}/release-manifest.json" \
+            --apk "${asset_directory}/ALT-PARKING-Guard-${RELEASE_TAG}.apk" \
+            --tag "$RELEASE_TAG" \
+            --source-sha "$SOURCE_SHA" \
+            --signer-sha256 "$SIGNER_SHA256" \
+            --receipt "${asset_directory}/rustore-submission.json" \
+            --receipt-sha256 "$RECEIPT_SHA256" \
+            --confirmation "$CONFIRMATION" > "${RUNNER_TEMP}/rustore-publish-status.json"
+
+      - name: Report confirmed RuStore publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat "${RUNNER_TEMP}/rustore-publish-status.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove manual publication material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Includes rustore-submission.json.publish-attempt.json.
+          rm -rf "${RUNNER_TEMP}/rustore-publish-assets"
+          rm -rf "${RUNNER_TEMP}/rustore-publish-private"
+          rm -f "${RUNNER_TEMP}/rustore-publish-release.json"
+          rm -f "${RUNNER_TEMP}/rustore-publish-status.json"
